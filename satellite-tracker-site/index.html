@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Satellite Tracker (self-hosted)</title>
+<script src="https://cdn.jsdelivr.net/npm/satellite.js@5.0.0/dist/satellite.min.js"></script>
+<style>
+:root{--bg:#0b1020;--panel:#121a33;--text:#e8edf9;--muted:#8ea0c9;--grid:#28345c;--land:#1b2748;color-scheme:dark}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#f4f6fb;--panel:#fff;--text:#13203d;--muted:#51628a;--grid:#c7d2ea;--land:#e4e9f7}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:12px 16px;border-bottom:1px solid var(--grid)}
+h1{font-size:1.05rem;margin:0 0 2px}
+header p{margin:0;font-size:.75rem;color:var(--muted)}
+#banner{display:none;background:#5a3b12;color:#ffd38a;padding:8px 16px;font-size:.8rem}
+main{display:flex;flex-direction:column;gap:10px;padding:12px;max-width:1000px;margin:0 auto}
+#mapWrap{overflow-x:auto;background:var(--panel);border-radius:10px;border:1px solid var(--grid)}
+canvas{display:block;width:100%;height:auto}
+.controls{display:flex;flex-wrap:wrap;gap:12px;background:var(--panel);border:1px solid var(--grid);border-radius:10px;padding:12px}
+.ctrl{display:flex;flex-direction:column;gap:4px;font-size:.85rem;color:var(--muted);min-width:140px;flex:1}
+.sats{display:flex;gap:8px;flex-wrap:wrap}
+.sat-chip{display:flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--grid);font-size:.8rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;font-size:.8rem}
+.stat b{display:block}
+.stat span{color:var(--muted);display:block}
+button{background:#4fd1ff;color:#06101f;border:none;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer}
+footer{padding:8px 16px;font-size:.72rem;color:var(--muted);text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰️ Satellite Tracker (self-hosted)</h1>
+  <p id="freshness">Φόρτωση δεδομένων…</p>
+</header>
+<div id="banner"></div>
+<main>
+  <div class="sats" id="satList"></div>
+  <div id="mapWrap"><canvas id="map" width="1000" height="520"></canvas></div>
+  <div class="controls">
+    <div class="ctrl"><label>Ταχύτητα χρόνου: <span id="speedLbl"></span></label>
+      <input type="range" id="speed" min="1" max="2000" value="120"></div>
+    <div class="ctrl"><label>Ημιγωνία αισθητήρα (FOV/2): <span id="fovLbl"></span>°</label>
+      <input type="range" id="fov" min="1" max="75" value="25"></div>
+    <div class="ctrl" style="justify-content:flex-end"><button id="play">⏸ Παύση</button></div>
+  </div>
+  <div class="stats" id="stats"></div>
+</main>
+<footer>tle_data.json ανανεώνεται αυτόματα από GitHub Action (δες README). SGP4 μέσω satellite.js.</footer>
+<script>
+const Re = 6371;
+const PALETTE = ['#4fd1ff','#ffcb6b','#ff6b81','#9dff6b','#c792ea','#6bffe0'];
+const FALLBACK = [
+  {id:'25544', name:'ISS (ZARYA)', line1:'1 25544U 98067A   26104.84437811  .00006957  00000+0  13466-3 0  9998',
+   line2:'2 25544  51.6321 253.5853 0006504 313.2650  46.7795 15.48918397561933', epoch:'2026-04-15'},
+  {id:'41747', name:'INTELSAT 36', line1:'1 41747U 16053A   26022.09080953 -.00000011  00000-0  00000-0 0  9997',
+   line2:'2 41747   0.0108  42.4580 0001572 291.3068 248.8665  1.00277278 34483', epoch:'2026-01-23'}
+];
+
+let sats = [], satrecs = {}, trails = {}, active = new Set();
+let simMinutes = 0, speed = 120, running = true, fovDeg = 25;
+const startTime = new Date();
+
+async function loadData(){
+  const banner = document.getElementById('banner');
+  let payload;
+  try{
+    const res = await fetch('./data/tle_data.json', {cache:'no-store'});
+    if(!res.ok) throw new Error('no file');
+    payload = await res.json();
+    document.getElementById('freshness').textContent =
+      'Ενημερώθηκε: ' + new Date(payload.fetched_at).toLocaleString('el-GR');
+  }catch(err){
+    payload = {fetched_at: null, satellites: FALLBACK};
+    banner.style.display = 'block';
+    banner.textContent = '⚠️ Δεν βρέθηκε data/tle_data.json — εμφανίζονται ενδεικτικά δεδομένα. Τρέξε το GitHub Action ή το script τοπικά.';
+    document.getElementById('freshness').textContent = 'Ενδεικτικά δεδομένα (fallback)';
+  }
+  sats = payload.satellites.map((s,i)=>({
+    id: String(s.id), name: s.name, l1: s.line1, l2: s.line2,
+    epoch: s.epoch, color: PALETTE[i % PALETTE.length]
+  }));
+  sats.forEach(s=>{ satrecs[s.id] = satellite.twoline2satrec(s.l1, s.l2); trails[s.id]=[]; });
+  active = new Set(sats.slice(0, Math.min(2, sats.length)).map(s=>s.id));
+  buildChips();
+}
+
+function subPoint(s, date){
+  const pv = satellite.propagate(satrecs[s.id], date);
+  if(!pv.position) return null;
+  const gmst = satellite.gstime(date);
+  const geo = satellite.eciToGeodetic(pv.position, gmst);
+  return {lat: satellite.degreesLat(geo.latitude), lon: satellite.degreesLong(geo.longitude), alt: geo.height};
+}
+function footprintRadiusDeg(alt, betaDeg){
+  const beta = betaDeg*Math.PI/180, ratio=(Re+alt)/Re, arg=ratio*Math.sin(beta);
+  if(arg>=1) return Math.acos(Re/(Re+alt))*180/Math.PI;
+  return Math.max(Math.asin(arg)-beta,0)*180/Math.PI;
+}
+
+const canvas=document.getElementById('map'), ctx=canvas.getContext('2d'), W=canvas.width, H=canvas.height;
+function toXY(lat,lon){ return [(lon+180)/360*W, (90-lat)/180*H]; }
+function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function drawGrid(){
+  ctx.fillStyle=cssVar('--land'); ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle=cssVar('--grid'); ctx.lineWidth=1;
+  for(let lon=-180;lon<=180;lon+=30){const [x]=toXY(0,lon);ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+  for(let lat=-90;lat<=90;lat+=30){const [,y]=toXY(lat,0);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  ctx.strokeStyle=cssVar('--muted');ctx.lineWidth=1.5;
+  const [,yEq]=toXY(0,0);ctx.beginPath();ctx.moveTo(0,yEq);ctx.lineTo(W,yEq);ctx.stroke();
+}
+function drawFootprint(lat,lon,r,color){
+  ctx.beginPath(); let started=false;
+  for(let a=0;a<=360;a+=4){
+    const ar=a*Math.PI/180, dLat=r*Math.cos(ar), dLon=r*Math.sin(ar)/Math.max(Math.cos(lat*Math.PI/180),0.15);
+    let plat=lat+dLat, plon=((lon+dLon+180)%360+360)%360-180;
+    const [x,y]=toXY(plat,plon);
+    if(!started){ctx.moveTo(x,y);started=true;} else ctx.lineTo(x,y);
+  }
+  ctx.closePath(); ctx.fillStyle=color+'33'; ctx.fill(); ctx.strokeStyle=color; ctx.lineWidth=1.5; ctx.stroke();
+}
+function render(){
+  drawGrid();
+  const statsEl=document.getElementById('stats'); statsEl.innerHTML='';
+  const now=new Date(startTime.getTime()+simMinutes*60000);
+  sats.filter(s=>active.has(s.id)).forEach(s=>{
+    const p=subPoint(s,now); if(!p) return;
+    trails[s.id].push(p); if(trails[s.id].length>250) trails[s.id].shift();
+    ctx.strokeStyle=s.color; ctx.lineWidth=2; ctx.beginPath();
+    let prev=null;
+    trails[s.id].forEach(pt=>{
+      if(prev && Math.abs(pt.lon-prev.lon)<180){
+        const [x1,y1]=toXY(prev.lat,prev.lon),[x2,y2]=toXY(pt.lat,pt.lon);
+        ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+      }
+      prev=pt;
+    });
+    ctx.stroke();
+    const r=footprintRadiusDeg(p.alt, fovDeg);
+    drawFootprint(p.lat,p.lon,r,s.color);
+    const [x,y]=toXY(p.lat,p.lon);
+    ctx.fillStyle=s.color; ctx.beginPath(); ctx.arc(x,y,5,0,7); ctx.fill();
+    ctx.fillStyle=cssVar('--text'); ctx.font='12px sans-serif'; ctx.fillText(s.name,x+8,y-8);
+    const div=document.createElement('div'); div.className='stat';
+    div.innerHTML=`<b>${s.name}</b><span>Lat ${p.lat.toFixed(1)}° Lon ${p.lon.toFixed(1)}°</span><span>Ύψος ${p.alt.toFixed(0)} km · Κάλυψη ~${(r*111).toFixed(0)} km</span><span>TLE epoch: ${s.epoch||'-'}</span>`;
+    statsEl.appendChild(div);
+  });
+}
+function buildChips(){
+  const wrap=document.getElementById('satList'); wrap.innerHTML='';
+  sats.forEach(s=>{
+    const lbl=document.createElement('label'); lbl.className='sat-chip'; lbl.style.borderColor=s.color;
+    lbl.innerHTML=`<input type="checkbox" ${active.has(s.id)?'checked':''}> ${s.name}`;
+    lbl.querySelector('input').addEventListener('change', e=>{ if(e.target.checked) active.add(s.id); else active.delete(s.id); });
+    wrap.appendChild(lbl);
+  });
+}
+document.getElementById('speed').addEventListener('input', e=>{ speed=+e.target.value; document.getElementById('speedLbl').textContent=speed+'x'; });
+document.getElementById('fov').addEventListener('input', e=>{ fovDeg=+e.target.value; document.getElementById('fovLbl').textContent=fovDeg; });
+document.getElementById('play').addEventListener('click', e=>{ running=!running; e.target.textContent=running?'⏸ Παύση':'▶ Συνέχεια'; });
+document.getElementById('speedLbl').textContent=speed+'x';
+document.getElementById('fovLbl').textContent=fovDeg;
+
+let last=performance.now();
+function loop(now){
+  const dt=(now-last)/1000; last=now;
+  if(running) simMinutes += dt*speed/60;
+  try{ render(); }catch(e){}
+  requestAnimationFrame(loop);
+}
+loadData().then(()=> requestAnimationFrame(loop));
+</script>
+</body>
+</html>
